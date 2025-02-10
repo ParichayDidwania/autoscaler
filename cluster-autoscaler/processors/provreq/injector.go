@@ -24,7 +24,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/pods"
 	"k8s.io/autoscaler/cluster-autoscaler/provisioningrequest"
 	provreqconditions "k8s.io/autoscaler/cluster-autoscaler/provisioningrequest/conditions"
 	provreqpods "k8s.io/autoscaler/cluster-autoscaler/provisioningrequest/pods"
@@ -38,17 +37,20 @@ import (
 
 // ProvisioningRequestPodsInjector creates in-memory pods from ProvisioningRequest and inject them to unscheduled pods list.
 type ProvisioningRequestPodsInjector struct {
-	initialRetryTime time.Duration
-	maxBackoffTime   time.Duration
-	backoffDuration  *lru.Cache
-	clock            clock.PassiveClock
-	client           *provreqclient.ProvisioningRequestClient
+	initialRetryTime                   time.Duration
+	maxBackoffTime                     time.Duration
+	backoffDuration                    *lru.Cache
+	clock                              clock.PassiveClock
+	client                             *provreqclient.ProvisioningRequestClient
+	lastProvisioningRequestProcessTime time.Time
+	checkCapacityBatchProcessing       bool
 }
 
 // IsAvailableForProvisioning checks if the provisioning request is the correct state for processing and provisioning has not been attempted recently.
 func (p *ProvisioningRequestPodsInjector) IsAvailableForProvisioning(pr *provreqwrapper.ProvisioningRequest) bool {
 	conditions := pr.Status.Conditions
 	if apimeta.IsStatusConditionTrue(conditions, v1.Failed) || apimeta.IsStatusConditionTrue(conditions, v1.Provisioned) {
+		p.backoffDuration.Remove(key(pr))
 		return false
 	}
 	provisioned := apimeta.FindStatusCondition(conditions, v1.Provisioned)
@@ -78,6 +80,7 @@ func (p *ProvisioningRequestPodsInjector) MarkAsAccepted(pr *provreqwrapper.Prov
 		klog.Errorf("failed add Accepted condition to ProvReq %s/%s, err: %v", pr.Namespace, pr.Name, err)
 		return err
 	}
+	p.UpdateLastProcessTime()
 	return nil
 }
 
@@ -87,6 +90,7 @@ func (p *ProvisioningRequestPodsInjector) MarkAsFailed(pr *provreqwrapper.Provis
 	if _, err := p.client.UpdateProvisioningRequest(pr.ProvisioningRequest); err != nil {
 		klog.Errorf("failed add Failed condition to ProvReq %s/%s, err: %v", pr.Namespace, pr.Name, err)
 	}
+	p.UpdateLastProcessTime()
 }
 
 // GetPodsFromNextRequest picks one ProvisioningRequest meeting the condition passed using isSupportedClass function, marks it as accepted and returns pods from it.
@@ -101,29 +105,69 @@ func (p *ProvisioningRequestPodsInjector) GetPodsFromNextRequest(
 		if !isSupportedClass(pr) {
 			continue
 		}
-		conditions := pr.Status.Conditions
-		if apimeta.IsStatusConditionTrue(conditions, v1.Failed) || apimeta.IsStatusConditionTrue(conditions, v1.Provisioned) {
-			p.backoffDuration.Remove(key(pr))
-			continue
-		}
 
 		// Inject pods if ProvReq wasn't scaled up before or it has Provisioned == False condition more than defaultRetryTime
 		if !p.IsAvailableForProvisioning(pr) {
 			continue
 		}
 
-		provreqpods, err := provreqpods.PodsForProvisioningRequest(pr)
+		podsFromProvReq, err := provreqpods.PodsForProvisioningRequest(pr)
 		if err != nil {
 			klog.Errorf("Failed to get pods for ProvisioningRequest %v", pr.Name)
 			p.MarkAsFailed(pr, provreqconditions.FailedToCreatePodsReason, err.Error())
 			continue
 		}
+		// Don't mark as accepted the check capacity ProvReq when batch processing is enabled.
+		// It will be marked later, in parallel, during processing the requests.
+		if pr.Spec.ProvisioningClassName == v1.ProvisioningClassCheckCapacity && p.checkCapacityBatchProcessing {
+			p.UpdateLastProcessTime()
+			return podsFromProvReq, nil
+		}
 		if err := p.MarkAsAccepted(pr); err != nil {
 			continue
 		}
-		return provreqpods, nil
+
+		return podsFromProvReq, nil
 	}
 	return nil, nil
+}
+
+// ProvisioningRequestWithPods contains a ProvisioningRequest Wrapper
+// and its associated pods.
+type ProvisioningRequestWithPods struct {
+	PrWrapper *provreqwrapper.ProvisioningRequest
+	Pods      []*apiv1.Pod
+}
+
+// GetCheckCapacityBatch returns up to the requested number of ProvisioningRequestWithPods.
+// We do not mark the PRs as accepted here.
+// If we fail to get the pods for a PR, we mark the PR as failed and issue an update.
+func (p *ProvisioningRequestPodsInjector) GetCheckCapacityBatch(maxPrs int) ([]ProvisioningRequestWithPods, error) {
+	provReqs, err := p.client.ProvisioningRequests()
+	if err != nil {
+		return nil, err
+	}
+	prsWithPods := make([]ProvisioningRequestWithPods, 0, min(maxPrs, len(provReqs)))
+	for _, pr := range provReqs {
+		if len(prsWithPods) >= maxPrs {
+			break
+		}
+		if pr.Spec.ProvisioningClassName != v1.ProvisioningClassCheckCapacity {
+			continue
+		}
+		if !p.IsAvailableForProvisioning(pr) {
+			continue
+		}
+
+		pods, err := provreqpods.PodsForProvisioningRequest(pr)
+		if err != nil {
+			klog.Errorf("Failed to get pods for ProvisioningRequest %v", pr.Name)
+			p.MarkAsFailed(pr, provreqconditions.FailedToCreatePodsReason, err.Error())
+			continue
+		}
+		prsWithPods = append(prsWithPods, ProvisioningRequestWithPods{pr, pods})
+	}
+	return prsWithPods, nil
 }
 
 // Process pick one ProvisioningRequest, update Accepted condition and inject pods to unscheduled pods list.
@@ -151,14 +195,34 @@ func (p *ProvisioningRequestPodsInjector) Process(
 func (p *ProvisioningRequestPodsInjector) CleanUp() {}
 
 // NewProvisioningRequestPodsInjector creates a ProvisioningRequest filter processor.
-func NewProvisioningRequestPodsInjector(kubeConfig *rest.Config, initialBackoffTime, maxBackoffTime time.Duration, maxCacheSize int) (pods.PodListProcessor, error) {
+func NewProvisioningRequestPodsInjector(kubeConfig *rest.Config, initialBackoffTime, maxBackoffTime time.Duration, maxCacheSize int, checkCapacityBatchProcessing bool) (*ProvisioningRequestPodsInjector, error) {
 	client, err := provreqclient.NewProvisioningRequestClient(kubeConfig)
 	if err != nil {
 		return nil, err
 	}
-	return &ProvisioningRequestPodsInjector{initialRetryTime: initialBackoffTime, maxBackoffTime: maxBackoffTime, backoffDuration: lru.New(maxCacheSize), client: client, clock: clock.RealClock{}}, nil
+	return &ProvisioningRequestPodsInjector{
+		initialRetryTime:                   initialBackoffTime,
+		maxBackoffTime:                     maxBackoffTime,
+		backoffDuration:                    lru.New(maxCacheSize),
+		client:                             client,
+		clock:                              clock.RealClock{},
+		lastProvisioningRequestProcessTime: time.Now(),
+		checkCapacityBatchProcessing:       checkCapacityBatchProcessing,
+	}, nil
 }
 
 func key(pr *provreqwrapper.ProvisioningRequest) string {
 	return string(pr.UID)
+}
+
+// LastProvisioningRequestProcessTime returns the time when the last provisioning request was processed.
+func (p *ProvisioningRequestPodsInjector) LastProvisioningRequestProcessTime() time.Time {
+	return p.lastProvisioningRequestProcessTime
+}
+
+// UpdateLastProcessTime updates the time we last processed a ProvisioningRequest
+// to now. This time is used to skip waiting between loops if a request
+// was processed in the last loop.
+func (p *ProvisioningRequestPodsInjector) UpdateLastProcessTime() {
+	p.lastProvisioningRequestProcessTime = p.clock.Now()
 }

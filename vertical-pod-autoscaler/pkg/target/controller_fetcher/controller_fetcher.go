@@ -18,7 +18,9 @@ package controllerfetcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -59,6 +61,9 @@ const (
 	discoveryResetPeriod time.Duration = 5 * time.Minute
 )
 
+// ErrNodeInvalidOwner is thrown when a Pod is owned by a Node.
+var ErrNodeInvalidOwner = errors.New("node is not a valid owner")
+
 // ControllerKey identifies a controller.
 type ControllerKey struct {
 	Namespace string
@@ -92,12 +97,12 @@ func (f *controllerFetcher) periodicallyRefreshCache(ctx context.Context, period
 			return
 		case <-time.After(period):
 			keysToRefresh := f.scaleSubresourceCacheStorage.GetKeysToRefresh()
-			klog.V(5).Info("Starting to refresh entries in controllerFetchers scaleSubresourceCacheStorage")
+			klog.V(5).InfoS("Starting to refresh entries in controllerFetchers scaleSubresourceCacheStorage")
 			for _, item := range keysToRefresh {
 				scale, err := f.scaleNamespacer.Scales(item.namespace).Get(context.TODO(), item.groupResource, item.name, metav1.GetOptions{})
 				f.scaleSubresourceCacheStorage.Refresh(item.namespace, item.groupResource, item.name, scale, err)
 			}
-			klog.V(5).Infof("Finished refreshing %d entries in controllerFetchers scaleSubresourceCacheStorage", len(keysToRefresh))
+			klog.V(5).InfoS("Finished refreshing entries in controllerFetchers scaleSubresourceCacheStorage", "refreshed", len(keysToRefresh))
 			f.scaleSubresourceCacheStorage.RemoveExpired()
 		}
 	}
@@ -111,7 +116,8 @@ func (f *controllerFetcher) Start(ctx context.Context, loopPeriod time.Duration)
 func NewControllerFetcher(config *rest.Config, kubeClient kube_client.Interface, factory informers.SharedInformerFactory, betweenRefreshes, lifeTime time.Duration, jitterFactor float64) *controllerFetcher {
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		klog.Fatalf("Could not create discoveryClient: %v", err)
+		klog.ErrorS(err, "Could not create discoveryClient")
+		os.Exit(255)
 	}
 	resolver := scale.NewDiscoveryScaleKindResolver(discoveryClient)
 	restClient := kubeClient.CoreV1().RESTClient()
@@ -136,9 +142,9 @@ func NewControllerFetcher(config *rest.Config, kubeClient kube_client.Interface,
 		go informer.Run(stopCh)
 		synced := cache.WaitForCacheSync(stopCh, informer.HasSynced)
 		if !synced {
-			klog.Warningf("Could not sync cache for %s: %v", kind, err)
+			klog.V(0).InfoS("Initial sync failed", "kind", kind)
 		} else {
-			klog.Infof("Initial sync of %s completed", kind)
+			klog.InfoS("Initial sync completed", "kind", kind)
 		}
 	}
 
@@ -261,7 +267,7 @@ func (f *controllerFetcher) isWellKnownOrScalable(ctx context.Context, key *Cont
 	//if not well known check if it supports scaling
 	groupKind, err := key.groupKind()
 	if err != nil {
-		klog.Errorf("Could not find groupKind for %s/%s: %v", key.Namespace, key.Name, err)
+		klog.ErrorS(err, "Could not find groupKind", "object", klog.KRef(key.Namespace, key.Name))
 		return false
 	}
 
@@ -271,7 +277,7 @@ func (f *controllerFetcher) isWellKnownOrScalable(ctx context.Context, key *Cont
 
 	mappings, err := f.mapper.RESTMappings(groupKind)
 	if err != nil {
-		klog.Errorf("Could not find mappings for %s: %v", groupKind, err)
+		klog.ErrorS(err, "Could not find mappings", "groupKind", groupKind, "object", klog.KRef(key.Namespace, key.Name))
 		return false
 	}
 
@@ -290,7 +296,7 @@ func (f *controllerFetcher) getOwnerForScaleResource(ctx context.Context, groupK
 		// Some pods specify nodes as their owners. This causes performance problems
 		// in big clusters when VPA tries to get all nodes. We know nodes aren't
 		// valid controllers so we can skip trying to fetch them.
-		return nil, fmt.Errorf("node is not a valid owner")
+		return nil, ErrNodeInvalidOwner
 	}
 	mappings, err := f.mapper.RESTMappings(groupKind)
 	if err != nil {

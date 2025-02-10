@@ -19,6 +19,7 @@ package target
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/client-go/discovery"
 	cacheddiscovery "k8s.io/client-go/discovery/cached"
 	"k8s.io/client-go/dynamic"
@@ -40,6 +40,8 @@ import (
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/cache"
 	klog "k8s.io/klog/v2"
+
+	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 )
 
 const (
@@ -69,7 +71,8 @@ const (
 func NewVpaTargetSelectorFetcher(config *rest.Config, kubeClient kube_client.Interface, factory informers.SharedInformerFactory) VpaTargetSelectorFetcher {
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		klog.Fatalf("Could not create discoveryClient: %v", err)
+		klog.ErrorS(err, "Could not create discoveryClient")
+		os.Exit(255)
 	}
 	resolver := scale.NewDiscoveryScaleKindResolver(discoveryClient)
 	restClient := kubeClient.CoreV1().RESTClient()
@@ -94,9 +97,10 @@ func NewVpaTargetSelectorFetcher(config *rest.Config, kubeClient kube_client.Int
 		go informer.Run(stopCh)
 		synced := cache.WaitForCacheSync(stopCh, informer.HasSynced)
 		if !synced {
-			klog.Fatalf("Could not sync cache for %s: %v", kind, err)
+			klog.ErrorS(nil, "Could not sync cache for "+string(kind))
+			os.Exit(255)
 		} else {
-			klog.Infof("Initial sync of %s completed", kind)
+			klog.InfoS("Initial sync completed", "kind", kind)
 		}
 	}
 
@@ -118,7 +122,7 @@ type vpaTargetSelectorFetcher struct {
 
 func (f *vpaTargetSelectorFetcher) Fetch(ctx context.Context, vpa *vpa_types.VerticalPodAutoscaler) (labels.Selector, error) {
 	if vpa.Spec.TargetRef == nil {
-		return nil, fmt.Errorf("targetRef not defined. If this is a v1beta1 object switch to v1beta2.")
+		return nil, fmt.Errorf("targetRef not defined. If this is a v1beta1 object, switch to v1.")
 	}
 	kind := wellKnownController(vpa.Spec.TargetRef.Kind)
 	informer, exists := f.informersMap[kind]
@@ -169,7 +173,7 @@ func getLabelSelector(informer cache.SharedIndexInformer, kind, namespace, name 
 	case (*corev1.ReplicationController):
 		return metav1.LabelSelectorAsSelector(metav1.SetAsLabelSelector(apiObj.Spec.Selector))
 	}
-	return nil, fmt.Errorf("don't know how to read label seletor")
+	return nil, fmt.Errorf("don't know how to read label selector")
 }
 
 func (f *vpaTargetSelectorFetcher) getLabelSelectorFromResource(
